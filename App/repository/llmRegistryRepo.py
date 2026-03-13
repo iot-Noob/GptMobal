@@ -18,8 +18,8 @@ class LLM_RegistryRepo:
     def get_llms(self, user_id: int, is_admin: bool = False) -> Dict[int, Any]:
         """
         Fetches LLMs based on role. 
-        Admin: Nested by user_id. 
-        User: Flattened for current user.
+        Admin: All LLMs (including inactive/deleted).
+        User: Only active, non-deleted models belonging to them.
         """
         try:
             query = self.db.query(RegisterLLM)
@@ -46,7 +46,8 @@ class LLM_RegistryRepo:
                 results = query.filter(
                     and_(
                         RegisterLLM.user_id == user_id,
-                        RegisterLLM.is_deleted == False
+                        RegisterLLM.is_deleted == False,
+                        RegisterLLM.is_active == True  # Only active LLMs
                     )
                 ).all()
                 
@@ -386,13 +387,17 @@ class LLM_RegistryRepo:
         """
         Get single LLM details.
         Admin can view any LLM.
-        Normal user can only view their own LLMs.
+        Normal user can only view their own active LLMs.
         """
         try:
             query = self.db.query(RegisterLLM).filter(RegisterLLM.id == llm_id)
             
             if not is_admin:
-                query = query.filter(RegisterLLM.user_id == user_id)
+                query = query.filter(
+                    RegisterLLM.user_id == user_id,
+                    RegisterLLM.is_active == True,  # Only active
+                    RegisterLLM.is_deleted == False
+                )
             
             llm = query.first()
             if not llm:

@@ -28,7 +28,7 @@ class RegisterLLM(Base): # <--- Must inherit from Base
     model_name = Column(String, nullable=False)
     model_path = Column(String, nullable=False)
     vram_estimate_gb = Column(Float, nullable=True) # Key for your RX 5600 XT
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=False)
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
