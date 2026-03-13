@@ -274,3 +274,91 @@ class SystemPromptRepo:
         except Exception as e:
             logger.error(f"Get deleted prompts failed: {e}")
             return []
+
+    def get_all_users_with_prompts(self, is_admin: bool) -> List[Dict[str, Any]]:
+        """Get all users with their prompts (admin only)"""
+        if not is_admin:
+            return []
+        
+        try:
+            from App.api.databases.Tables import User
+            users = self.db.query(User).filter(User.is_deleted == False).all()
+            result = []
+            for user in users:
+                prompts = self.db.query(SystemPrompt).filter(
+                    SystemPrompt.user_id == user.id,
+                    SystemPrompt.is_deleted == False
+                ).all()
+                result.append({
+                    "user_id": user.id,
+                    "username": user.username,
+                    "email": user.email,
+                    "prompts": [
+                        {
+                            "prompt_id": p.id,
+                            "persona_name": p.persona_name,
+                            "model_id": p.model_id,
+                            "is_active": p.is_active
+                        }
+                        for p in prompts
+                    ]
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Get users with prompts failed: {e}")
+            return []
+
+    def get_all_models_with_prompts(self, is_admin: bool) -> List[Dict[str, Any]]:
+        """Get all models with their prompts (admin only)"""
+        if not is_admin:
+            return []
+        
+        try:
+            models = self.db.query(RegisterLLM).filter(RegisterLLM.is_deleted == False).all()
+            result = []
+            for model in models:
+                prompts = self.db.query(SystemPrompt).filter(
+                    SystemPrompt.model_id == model.id,
+                    SystemPrompt.is_deleted == False
+                ).all()
+                result.append({
+                    "model_id": model.id,
+                    "model_name": model.model_name,
+                    "owner_user_id": model.user_id,
+                    "prompts": [
+                        {
+                            "prompt_id": p.id,
+                            "persona_name": p.persona_name,
+                            "user_id": p.user_id,
+                            "is_active": p.is_active
+                        }
+                        for p in prompts
+                    ]
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Get models with prompts failed: {e}")
+            return []
+
+    def get_llms_with_owners(self, is_admin: bool) -> List[Dict[str, Any]]:
+        """Get all LLMs with their owners (admin only)"""
+        if not is_admin:
+            return []
+        
+        try:
+            models = self.db.query(RegisterLLM).filter(RegisterLLM.is_deleted == False).all()
+            result = []
+            for model in models:
+                user = self.db.query(User).filter(User.id == model.user_id).first()
+                result.append({
+                    "llm_id": model.id,
+                    "model_name": model.model_name,
+                    "model_path": model.model_path,
+                    "owner_user_id": model.user_id,
+                    "owner_username": user.username if user else None,
+                    "is_active": model.is_active
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Get LLMs with owners failed: {e}")
+            return []

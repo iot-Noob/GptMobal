@@ -215,3 +215,45 @@ async def get_all_prompts_admin(
     repo = SystemPromptRepo(db)
     prompts = repo.get_prompts(current_user["id"], is_admin=True)
     return {"prompts": prompts}
+
+
+@router.get("/admin/users-with-prompts")
+async def get_users_with_prompts(
+    db: Session = Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Admin: Get all users with their assigned prompts"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can access this")
+    
+    repo = SystemPromptRepo(db)
+    result = repo.get_all_users_with_prompts(is_admin=True)
+    return {"users_with_prompts": result}
+
+
+@router.get("/admin/models-with-prompts")
+async def get_models_with_prompts(
+    db: Session = Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Admin: Get all models with their assigned prompts"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can access this")
+    
+    repo = SystemPromptRepo(db)
+    result = repo.get_all_models_with_prompts(is_admin=True)
+    return {"models_with_prompts": result}
+
+
+@router.get("/admin/llms-with-owners")
+async def get_llms_with_owners(
+    db: Session = Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Admin: Get all LLMs with their owners"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can access this")
+    
+    repo = SystemPromptRepo(db)
+    result = repo.get_llms_with_owners(is_admin=True)
+    return {"llms_with_owners": result}
