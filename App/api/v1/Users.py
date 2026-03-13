@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 from typing import List
 import logging
 
@@ -28,7 +29,7 @@ from App.models.userModels import (
     UserRole
 )
 
-router = APIRouter(prefix="/users", tags=["Users"])
+router = APIRouter(prefix="/users" )
 
 # Logger for user operations
 logger = logging.getLogger(__name__)
@@ -69,7 +70,14 @@ async def signup(
         "disabled": False
     }
     
-    user = repo.create_user(db_user_data)
+    try:
+        user = repo.create_user(db_user_data)
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during signup: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     logger.info(f"New user registered: {user.username} (ID: {user.id})")
     
@@ -275,7 +283,14 @@ async def update_user(
     if user_update.full_name is not None:
         update_data["full_name"] = user_update.full_name
     
-    updated_user = repo.update_user(target_user_id, update_data)
+    try:
+        updated_user = repo.update_user(target_user_id, update_data)
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during update: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     return UserData(
         id=updated_user.id,
@@ -313,7 +328,14 @@ async def delete_user(
             detail="User not found"
         )
     
-    success = repo.delete_user(target_user_id, soft_delete=not hard_delete)
+    try:
+        success = repo.delete_user(target_user_id, soft_delete=not hard_delete)
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during delete: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     logger.warning(f"User deleted: ID {target_user_id} by admin {current_user['id']} (hard_delete={hard_delete})")
     
@@ -331,7 +353,14 @@ async def restore_user(
     """Restore a soft-deleted user (admin only)"""
     repo = UserRepository(db)
     
-    restored_user = repo.restore_user(user_id)
+    try:
+        restored_user = repo.restore_user(user_id)
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during restore: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     if not restored_user:
         raise HTTPException(
@@ -359,7 +388,14 @@ async def deactivate_user(
     """Deactivate a user account (admin only)"""
     repo = UserRepository(db)
     
-    success = repo.deactivate_user(user_id)
+    try:
+        success = repo.deactivate_user(user_id)
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during deactivate: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     if not success:
         raise HTTPException(
@@ -379,7 +415,14 @@ async def activate_user(
     """Activate a user account (admin only)"""
     repo = UserRepository(db)
     
-    success = repo.activate_user(user_id)
+    try:
+        success = repo.activate_user(user_id)
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during activate: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     if not success:
         raise HTTPException(
@@ -438,10 +481,17 @@ async def change_password(
         )
     
     # Update password
-    success = repo.change_password(
-        current_user["id"], 
-        get_password_hash(password_data.new_password)
-    )
+    try:
+        success = repo.change_password(
+            current_user["id"], 
+            get_password_hash(password_data.new_password)
+        )
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during password change: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     if not success:
         raise HTTPException(
@@ -471,7 +521,14 @@ async def reset_user_password(
         )
     
     # Reset password
-    success = repo.reset_password(user_id, get_password_hash(password_data.new_password))
+    try:
+        success = repo.reset_password(user_id, get_password_hash(password_data.new_password))
+    except SQLAlchemyError as e:
+        logger.error(f"Database error during password reset: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database error occurred"
+        )
     
     logger.warning(f"Password reset for user ID {user_id} by admin {current_user['id']}")
     
