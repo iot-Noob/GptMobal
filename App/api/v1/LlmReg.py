@@ -2,7 +2,10 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+import asyncio
+import json
 
 from App.api.dependencies.sqlite_connector import get_db
 from App.api.dependencies.auth import get_current_user
@@ -10,11 +13,12 @@ from App.repository.llmRegistryRepo import LLM_RegistryRepo
 from App.repository.userRepository import UserRepository
 from App.core.settings import settings
 from App.schemas.llmSchemas import LLMRegister, LLMUpdate
+from App.api.dependencies.lcConnector import get_llm_connector, LcConnector
 
-router = APIRouter()
+llm_router = APIRouter()
 
 
-@router.post("/register")
+@llm_router.post("/register")
 async def register_new_llm(
     model_name: str = Query(..., description="Custom name for the LLM"),
     model_filename: str = Query(..., description="Filename of the model in the models directory"),
@@ -26,15 +30,15 @@ async def register_new_llm(
     - User provides custom name and model filename
     - System validates the file exists in MODELS_PATH
     - System auto-calculates file size
-    - System checks for duplicate names for this user
+    - System checks for duplicate names
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Only admins can register LLMs")
     try:
         repo = LLM_RegistryRepo(db)
         
-        # Check for duplicate model name for this user
-        duplicate_check = repo.check_duplicate_model_name(model_name, current_user["id"])
+        # Check for duplicate model name
+        duplicate_check = repo.check_duplicate_model_name(model_name)
         if duplicate_check["is_duplicate"]:
             raise HTTPException(
                 status_code=400, 
@@ -58,10 +62,8 @@ async def register_new_llm(
         # Register the LLM in DB
         from App.api.databases.Tables import RegisterLLM
         new_llm = RegisterLLM(
-            user_id=current_user["id"],
             model_name=model_name,
             model_path=str(model_path),
-            vram_estimate_gb=0.0,  # Will be updated by admin later if needed
             is_active=False  # Not active by default - must be activated manually
         )
         repo.db.add(new_llm)
@@ -83,7 +85,7 @@ async def register_new_llm(
         raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
 
 
-@router.get("/my-models")
+@llm_router.get("/my-models")
 async def list_user_models(
     db: Session = Depends(get_db),
     current_user: Dict = Depends(get_current_user)
@@ -98,7 +100,7 @@ async def list_user_models(
     return repo.get_llms(user_id=current_user["id"], is_admin=is_admin)
 
 
-@router.get("/details/{llm_id}")
+@llm_router.get("/details/{llm_id}")
 async def get_llm_details(
     llm_id: int,
     db: Session = Depends(get_db),
@@ -124,7 +126,7 @@ async def get_llm_details(
     return llm
 
 
-@router.patch("/update/{llm_id}")
+@llm_router.patch("/update/{llm_id}")
 async def update_model_info(
     llm_id: int,
     update_data: LLMUpdate,
@@ -133,6 +135,7 @@ async def update_model_info(
 ):
     """
     Update LLM information. Admin only.
+    Can also set/unset global status.
     """
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Only admins can update LLM information")
@@ -143,7 +146,7 @@ async def update_model_info(
     update_dict = {}
     if update_data.model_name is not None:
         # Check for duplicate name
-        duplicate_check = repo.check_duplicate_model_name(update_data.model_name, current_user["id"])
+        duplicate_check = repo.check_duplicate_model_name(update_data.model_name)
         if duplicate_check["is_duplicate"]:
             # Allow if it's the same LLM being updated
             existing_llm = repo.get_llm_by_id(llm_id, current_user["id"], True)
@@ -183,7 +186,49 @@ async def update_model_info(
     return {"message": "Update successful"}
 
 
-@router.delete("/delete/{llm_id}")
+@llm_router.post("/admin/activate/{llm_id}")
+async def activate_llm_for_all(
+    llm_id: int,
+    db: Session = Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """
+    Admin only: Activate an LLM so all users can use it.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can activate LLMs")
+    
+    repo = LLM_RegistryRepo(db)
+    result = repo.set_llm_active(llm_id, current_user["id"], True, True)
+    
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    
+    return result
+
+
+@llm_router.post("/admin/deactivate/{llm_id}")
+async def deactivate_llm(
+    llm_id: int,
+    db: Session = Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """
+    Admin only: Deactivate an LLM so no users can use it.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can deactivate LLMs")
+    
+    repo = LLM_RegistryRepo(db)
+    result = repo.set_llm_active(llm_id, current_user["id"], True, False)
+    
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    
+    return result
+
+
+@llm_router.delete("/delete/{llm_id}")
 async def delete_model(
     llm_id: int,
     db: Session = Depends(get_db),
@@ -203,7 +248,7 @@ async def delete_model(
     return result
 
 
-# @router.post("/activate/{llm_id}")
+# @llm_router.post("/activate/{llm_id}")
 # async def activate_llm(
 #     llm_id: int,
 #     db: Session = Depends(get_db),
@@ -222,7 +267,7 @@ async def delete_model(
 #     return result
 
 
-# @router.post("/deactivate/{llm_id}")
+# @llm_router.post("/deactivate/{llm_id}")
 # async def deactivate_llm(
 #     llm_id: int,
 #     db: Session = Depends(get_db),
@@ -243,7 +288,7 @@ async def delete_model(
 
 # ==================== ADMIN ONLY ENDPOINTS ====================
 
-@router.post("/admin/assign-to-user")
+@llm_router.post("/admin/assign-to-user")
 async def assign_llm_to_user(
     llm_id: int = Query(..., description="ID of the LLM to assign"),
     target_user_id: int = Query(..., description="ID of the user to assign the LLM to"),
@@ -265,7 +310,7 @@ async def assign_llm_to_user(
     return result
 
 
-@router.get("/admin/all-llms")
+@llm_router.get("/admin/all-llms")
 async def get_all_llms_admin(
     db: Session = Depends(get_db),
     current_user: Dict = Depends(get_current_user)
@@ -281,7 +326,7 @@ async def get_all_llms_admin(
     return {"llms": llms}
 
 
-@router.get("/admin/deleted-llms")
+@llm_router.get("/admin/deleted-llms")
 async def get_deleted_llms(
     db: Session = Depends(get_db),
     current_user: Dict = Depends(get_current_user)
@@ -313,7 +358,7 @@ async def get_deleted_llms(
     }
 
 
-@router.post("/admin/restore/{llm_id}")
+@llm_router.post("/admin/restore/{llm_id}")
 async def restore_llm(
     llm_id: int,
     db: Session = Depends(get_db),
@@ -334,7 +379,7 @@ async def restore_llm(
     return result
 
 
-@router.get("/admin/all-users")
+@llm_router.get("/admin/all-users")
 async def get_all_users_for_assignment(
     db: Session = Depends(get_db),
     current_user: Dict = Depends(get_current_user)
@@ -363,7 +408,7 @@ async def get_all_users_for_assignment(
     }
 
 
-@router.get("/admin/models-directory")
+@llm_router.get("/admin/models-directory")
 async def get_models_directory(
     current_user: Dict = Depends(get_current_user)
 ):
@@ -380,7 +425,7 @@ async def get_models_directory(
     }
 
 
-@router.get("/available-models")
+@llm_router.get("/available-models")
 async def get_available_models(
     current_user: Dict = Depends(get_current_user)
 ):
@@ -396,3 +441,32 @@ async def get_available_models(
         "total_models": len(models),
         "models": models
     }
+
+
+# ==================== CENTRAL MODEL MANAGEMENT ====================
+# Note: Central model management (load/unload/info) is handled in langChainsRoutes.py
+
+
+@llm_router.get("/enabled")
+async def get_enabled_llms(
+    db: Session = Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get all enabled LLMs (not deleted)."""
+    repo = LLM_RegistryRepo(db)
+    llms = repo.get_all_enabled_llms()
+    return {"enabled_llms": llms}
+
+@llm_router.get("/admin/llms-with-owners")
+async def get_llms_with_owners(
+    db: Session = Depends(get_db),
+    current_user: Dict = Depends(get_current_user)
+):
+    """Admin: Get all LLMs with who activated them"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can access this")
+    
+    repo = LLM_RegistryRepo(db)
+    result = repo.get_llms_with_owners(is_admin=True)
+    return {"llms_with_owners": result}
+

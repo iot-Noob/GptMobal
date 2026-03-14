@@ -12,19 +12,13 @@ class SystemPromptRepo:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_prompt(self, user_id: int, model_id: int, persona_name: str, prompt_text: str) -> Dict[str, Any]:
+    def create_prompt(self, user_id: int, role: str, prompt: str) -> Dict[str, Any]:
         """Create a new system prompt"""
         try:
-            # Check if model exists and belongs to user (or user is admin)
-            model = self.db.query(RegisterLLM).filter(RegisterLLM.id == model_id).first()
-            if not model:
-                return {"success": False, "message": "Model not found"}
-            
             new_prompt = SystemPrompt(
                 user_id=user_id,
-                model_id=model_id,
-                persona_name=persona_name,
-                prompt_text=prompt_text,
+                role=role,
+                prompt=prompt,
                 is_active=True
             )
             self.db.add(new_prompt)
@@ -45,8 +39,7 @@ class SystemPromptRepo:
         """
         Get prompts for user.
         Admin sees all non-deleted prompts.
-        User sees only: assigned to them + not deleted + is_active.
-        Deleted prompts are NEVER shown, even to admins.
+        User sees only: their own prompts that are active and not deleted.
         """
         try:
             query = self.db.query(SystemPrompt)
@@ -66,10 +59,8 @@ class SystemPromptRepo:
                 {
                     "id": p.id,
                     "user_id": p.user_id,
-                    "model_id": p.model_id,
-                    "persona_name": p.persona_name,
-                    "prompt_text": p.prompt_text,
-                    "version_number": p.version_number,
+                    "role": p.role,
+                    "prompt": p.prompt,
                     "is_active": p.is_active,
                     "is_deleted": p.is_deleted,
                     "created_at": p.created_at.isoformat() if p.created_at else None
@@ -106,10 +97,8 @@ class SystemPromptRepo:
             return {
                 "id": prompt.id,
                 "user_id": prompt.user_id,
-                "model_id": prompt.model_id,
-                "persona_name": prompt.persona_name,
-                "prompt_text": prompt.prompt_text,
-                "version_number": prompt.version_number,
+                "role": prompt.role,
+                "prompt": prompt.prompt,
                 "is_active": prompt.is_active,
                 "is_deleted": prompt.is_deleted,
                 "created_at": prompt.created_at.isoformat() if prompt.created_at else None
@@ -129,6 +118,12 @@ class SystemPromptRepo:
             prompt = query.first()
             if not prompt:
                 return {"success": False, "message": "Prompt not found or unauthorized"}
+            
+            # Handle renamed fields
+            if "persona_name" in update_data:
+                update_data["role"] = update_data.pop("persona_name")
+            if "prompt_text" in update_data:
+                update_data["prompt"] = update_data.pop("prompt_text")
             
             for key, value in update_data.items():
                 if hasattr(prompt, key):
@@ -219,40 +214,6 @@ class SystemPromptRepo:
             logger.error(f"Assign prompt failed: {e}")
             return {"success": False, "message": f"Error: {str(e)}"}
 
-    def assign_prompt_to_model(self, prompt_id: int, model_id: int, admin_id: int) -> Dict[str, Any]:
-        """Admin assigns a prompt to a different model"""
-        try:
-            prompt = self.db.query(SystemPrompt).filter(SystemPrompt.id == prompt_id).first()
-            if not prompt:
-                return {"success": False, "message": "Prompt not found"}
-            
-            # Prevent assigning deleted prompts
-            if prompt.is_deleted:
-                return {"success": False, "message": "Cannot assign a deleted prompt"}
-            
-            model = self.db.query(RegisterLLM).filter(RegisterLLM.id == model_id).first()
-            if not model:
-                return {"success": False, "message": "Model not found"}
-            
-            admin = self.db.query(User).filter(User.id == admin_id).first()
-            if not admin or not admin.is_admin:
-                return {"success": False, "message": "Only admins can reassign prompts"}
-            
-            old_model_id = prompt.model_id
-            prompt.model_id = model_id
-            self.db.commit()
-            
-            return {
-                "success": True,
-                "message": f"Prompt assigned to model {model_id}",
-                "prompt_id": prompt_id,
-                "new_model_id": model_id
-            }
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Assign prompt to model failed: {e}")
-            return {"success": False, "message": f"Error: {str(e)}"}
-
     def get_deleted_prompts(self, is_admin: bool) -> List[Dict[str, Any]]:
         """Get deleted prompts (admin only)"""
         if not is_admin:
@@ -264,8 +225,7 @@ class SystemPromptRepo:
                 {
                     "id": p.id,
                     "user_id": p.user_id,
-                    "model_id": p.model_id,
-                    "persona_name": p.persona_name,
+                    "role": p.role,
                     "is_deleted": p.is_deleted,
                     "created_at": p.created_at.isoformat() if p.created_at else None
                 }
@@ -296,8 +256,7 @@ class SystemPromptRepo:
                     "prompts": [
                         {
                             "prompt_id": p.id,
-                            "persona_name": p.persona_name,
-                            "model_id": p.model_id,
+                            "role": p.role,
                             "is_active": p.is_active
                         }
                         for p in prompts
@@ -306,59 +265,4 @@ class SystemPromptRepo:
             return result
         except Exception as e:
             logger.error(f"Get users with prompts failed: {e}")
-            return []
-
-    def get_all_models_with_prompts(self, is_admin: bool) -> List[Dict[str, Any]]:
-        """Get all models with their prompts (admin only)"""
-        if not is_admin:
-            return []
-        
-        try:
-            models = self.db.query(RegisterLLM).filter(RegisterLLM.is_deleted == False).all()
-            result = []
-            for model in models:
-                prompts = self.db.query(SystemPrompt).filter(
-                    SystemPrompt.model_id == model.id,
-                    SystemPrompt.is_deleted == False
-                ).all()
-                result.append({
-                    "model_id": model.id,
-                    "model_name": model.model_name,
-                    "owner_user_id": model.user_id,
-                    "prompts": [
-                        {
-                            "prompt_id": p.id,
-                            "persona_name": p.persona_name,
-                            "user_id": p.user_id,
-                            "is_active": p.is_active
-                        }
-                        for p in prompts
-                    ]
-                })
-            return result
-        except Exception as e:
-            logger.error(f"Get models with prompts failed: {e}")
-            return []
-
-    def get_llms_with_owners(self, is_admin: bool) -> List[Dict[str, Any]]:
-        """Get all LLMs with their owners (admin only)"""
-        if not is_admin:
-            return []
-        
-        try:
-            models = self.db.query(RegisterLLM).filter(RegisterLLM.is_deleted == False).all()
-            result = []
-            for model in models:
-                user = self.db.query(User).filter(User.id == model.user_id).first()
-                result.append({
-                    "llm_id": model.id,
-                    "model_name": model.model_name,
-                    "model_path": model.model_path,
-                    "owner_user_id": model.user_id,
-                    "owner_username": user.username if user else None,
-                    "is_active": model.is_active
-                })
-            return result
-        except Exception as e:
-            logger.error(f"Get LLMs with owners failed: {e}")
             return []

@@ -24,11 +24,11 @@ class RegisterLLM(Base): # <--- Must inherit from Base
     __tablename__ = "registered_llms"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id")) # <--- Reference the table.column string
+    activated_by = Column(Integer, ForeignKey("users.id"), nullable=True) # User who activated this LLM
     model_name = Column(String, nullable=False)
     model_path = Column(String, nullable=False)
-    vram_estimate_gb = Column(Float, nullable=True) # Key for your RX 5600 XT
-    is_active = Column(Boolean, default=False)
+    is_enabled = Column(Boolean, default=False) # Admin can enable/disable
+    is_active = Column(Boolean, default=True)
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -39,14 +39,21 @@ class SystemPrompt(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
-    model_id = Column(Integer, ForeignKey("registered_llms.id"))
-    persona_name = Column(String, index=True) # e.g., 'Analyst'
-    prompt_text = Column(Text, nullable=False) # Use Text for long prompts
-    version_number = Column(Integer, default=1)
+    role = Column(String, index=True) # e.g., 'Analyst', 'Assistant'
+    prompt = Column(Text, nullable=False) # The system prompt text
     is_active = Column(Boolean, default=True)
     is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+# User-Persona Assignment
+class UserPersona(Base):
+    __tablename__ = "user_personas"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    persona_id = Column(Integer, ForeignKey("system_prompts.id"))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 Base.metadata.create_all(bind=engine)
 

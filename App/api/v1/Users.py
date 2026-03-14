@@ -209,13 +209,17 @@ async def get_user(
     """Get user by ID - normal users get their own info, admins can get any user"""
     repo = UserRepository(db)
     
-    # Normal users always get their own profile, admins can specify any user_id
-    if current_user.get("role") != "admin":
-        # Normal users ignore the user_id and get their own profile
-        user = repo.get_by_id(current_user["id"])
-    else:
-        # Admins can get any user
-        user = repo.get_by_id(user_id)
+    # Check if user is admin or getting their own profile
+    is_admin = current_user.get("role") == "admin"
+    is_own_profile = current_user["id"] == user_id
+    
+    if not is_admin and not is_own_profile:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only view your own profile"
+        )
+    
+    user = repo.get_by_id(user_id)
     
     if not user:
         raise HTTPException(
@@ -244,11 +248,17 @@ async def update_user(
     """Update user information - normal users update own profile, admins update any user"""
     repo = UserRepository(db)
     
-    # Normal users always update their own profile, admins can specify any user_id
-    if current_user.get("role") != "admin":
-        target_user_id = current_user["id"]
-    else:
-        target_user_id = user_id
+    # Check if user is admin or updating their own profile
+    is_admin = current_user.get("role") == "admin"
+    is_own_profile = current_user["id"] == user_id
+    
+    if not is_admin and not is_own_profile:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only update your own profile"
+        )
+    
+    target_user_id = user_id
     
     # Check if user exists
     existing_user = repo.get_by_id(target_user_id)
@@ -313,12 +323,19 @@ async def delete_user(
     """Delete user - normal users delete own account, admins delete any user"""
     repo = UserRepository(db)
     
-    # Normal users always delete their own account, admins can delete any user
-    if current_user.get("role") != "admin":
-        target_user_id = current_user["id"]
+    # Check if user is admin or deleting their own account
+    is_admin = current_user.get("role") == "admin"
+    is_own_account = current_user["id"] == user_id
+    
+    if not is_admin and not is_own_account:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own account"
+        )
+    
+    target_user_id = user_id
+    if not is_admin:
         hard_delete = False  # Normal users can't hard delete
-    else:
-        target_user_id = user_id
     
     # Check if user exists
     existing_user = repo.get_by_id(target_user_id)

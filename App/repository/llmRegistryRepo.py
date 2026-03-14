@@ -19,7 +19,7 @@ class LLM_RegistryRepo:
         """
         Fetches LLMs based on role. 
         Admin: All LLMs (including inactive/deleted).
-        User: Only active, non-deleted models belonging to them.
+        User: Active LLMs (their own OR activated by any user).
         """
         try:
             query = self.db.query(RegisterLLM)
@@ -29,12 +29,13 @@ class LLM_RegistryRepo:
                 results = query.all()
                 admin_data = {}
                 for llm in results:
-                    if llm.user_id not in admin_data:
-                        admin_data[llm.user_id] = {}
+                    if llm.activated_by not in admin_data:
+                        admin_data[llm.activated_by] = {}
                     
-                    admin_data[llm.user_id][llm.id] = {
+                    admin_data[llm.activated_by][llm.id] = {
                         "model_name": llm.model_name,
                         "model_path": llm.model_path,
+                        "activated_by": llm.activated_by,
                         "is_active": llm.is_active,
                         "is_deleted": llm.is_deleted,
                         "updated_at": llm.updated_at,
@@ -42,10 +43,9 @@ class LLM_RegistryRepo:
                     }
                 return admin_data
             else:
-                # Normal user: Only active, non-deleted models belonging to them
+                # Normal user: Active LLMs (their own OR activated by anyone)
                 results = query.filter(
                     and_(
-                        RegisterLLM.user_id == user_id,
                         RegisterLLM.is_deleted == False,
                         RegisterLLM.is_active == True  # Only active LLMs
                     )
@@ -53,15 +53,14 @@ class LLM_RegistryRepo:
                 
                 return {
                     llm.id: {
-                        "user_id": llm.user_id,
+                        "activated_by": llm.activated_by,
                         "details": {
                             "model_name": llm.model_name,
                             "model_path": llm.model_path,
                             "is_active": llm.is_active
                         },
                         "created_at": llm.created_at,
-                        "updated_at": llm.updated_at,
-                        "deleted_at": llm.deleted_at if hasattr(llm, 'deleted_at') else None
+                        "updated_at": llm.updated_at
                     } for llm in results
                 }
 
@@ -74,13 +73,12 @@ class LLM_RegistryRepo:
     def update_llm(self, llm_id: int, user_id: int, is_admin: bool, update_data: Dict[str, Any]):
         """
         Admin can update any model/path. 
-        User can only update their own assigned models.
         """
         try:
             query = self.db.query(RegisterLLM).filter(RegisterLLM.id == llm_id)
             
             if not is_admin:
-                query = query.filter(RegisterLLM.user_id == user_id)
+                query = query.filter(RegisterLLM.activated_by == user_id)
             
             llm = query.first()
             if not llm:
@@ -148,37 +146,81 @@ class LLM_RegistryRepo:
 
     def set_llm_active(self, llm_id: int, user_id: int, is_admin: bool, is_active: bool):
         """
-        Set LLM as active/inactive (loaded/unloaded).
-        Users can only activate their own LLMs.
-        Admins can activate any LLM.
+        Enable/Disable an LLM (admin only).
+        When enabled, it's available to all users.
         """
         try:
             query = self.db.query(RegisterLLM).filter(RegisterLLM.id == llm_id)
-            if not is_admin:
-                query = query.filter(RegisterLLM.user_id == user_id)
             
             llm = query.first()
             if not llm:
-                return {"success": False, "message": "LLM not found or unauthorized"}
+                return {"success": False, "message": "LLM not found"}
             
             # Check if already in desired state
-            if llm.is_active == is_active:
-                status = "active" if is_active else "inactive"
+            if llm.is_enabled == is_active:
+                status = "enabled" if is_active else "disabled"
                 return {"success": False, "message": f"LLM is already {status}"}
             
-            # Cannot activate a deleted LLM
+            # Cannot enable a deleted LLM
             if is_active and llm.is_deleted:
-                return {"success": False, "message": "Cannot activate a deleted LLM"}
+                return {"success": False, "message": "Cannot enable a deleted LLM"}
             
-            llm.is_active = is_active
+            llm.is_enabled = is_active
+            llm.activated_by = user_id
             self.db.commit()
             
-            status = "activated" if is_active else "deactivated"
+            status = "enabled" if is_active else "disabled"
             return {"success": True, "message": f"LLM {status} successfully"}
         except Exception as e:
             self.db.rollback()
-            logger.error(f"❌ Set active failed: {e}")
+            logger.error(f"❌ Set enabled failed: {e}")
             return {"success": False, "message": f"Failed: {str(e)}"}
+
+    def get_enabled_llm(self):
+        """Get the currently enabled LLM (not deleted)"""
+        try:
+            llm = self.db.query(RegisterLLM).filter(
+                RegisterLLM.is_enabled == True,
+                RegisterLLM.is_deleted == False
+            ).first()
+            
+            if not llm:
+                return None
+            
+            return {
+                "id": llm.id,
+                "model_name": llm.model_name,
+                "model_path": llm.model_path,
+                "is_enabled": llm.is_enabled,
+                "is_active": llm.is_active,
+                "activated_by": llm.activated_by
+            }
+        except Exception as e:
+            logger.error(f"Get enabled LLM failed: {e}")
+            return None
+
+    def get_all_enabled_llms(self):
+        """Get all enabled LLMs (not deleted)"""
+        try:
+            llms = self.db.query(RegisterLLM).filter(
+                RegisterLLM.is_enabled == True,
+                RegisterLLM.is_deleted == False
+            ).all()
+            
+            return [
+                {
+                    "id": llm.id,
+                    "model_name": llm.model_name,
+                    "model_path": llm.model_path,
+                    "is_enabled": llm.is_enabled,
+                    "is_active": llm.is_active,
+                    "activated_by": llm.activated_by
+                }
+                for llm in llms
+            ]
+        except Exception as e:
+            logger.error(f"Get enabled LLMs failed: {e}")
+            return []
 
     def get_deleted_llms(self, is_admin: bool):
         """Admin only view for trash bin"""
@@ -188,15 +230,14 @@ class LLM_RegistryRepo:
 
     # --- DUPLICATE CHECK ---
 
-    def check_duplicate_model_name(self, model_name: str, user_id: int) -> Dict[str, Any]:
+    def check_duplicate_model_name(self, model_name: str) -> Dict[str, Any]:
         """
-        Check if a model with the same custom name already exists for this user.
+        Check if a model with the same custom name already exists.
         Returns dict with is_duplicate and existing LLM info.
         """
         try:
             existing = self.db.query(RegisterLLM).filter(
                 RegisterLLM.model_name == model_name,
-                RegisterLLM.user_id == user_id,
                 RegisterLLM.is_deleted == False
             ).first()
             
@@ -345,8 +386,8 @@ class LLM_RegistryRepo:
 
     def assign_llm_to_user(self, llm_id: int, target_user_id: int, admin_id: int) -> Dict[str, Any]:
         """
-        Admin assigns an LLM to another user.
-        Returns dict with success status and message.
+        Admin activates an LLM for all users.
+        This replaces the old "assign to user" - now LLMs are activated globally.
         """
         try:
             # Check if LLM exists
@@ -362,24 +403,24 @@ class LLM_RegistryRepo:
             # Check if admin has permission (admin_id should be admin)
             admin = self.db.query(User).filter(User.id == admin_id).first()
             if not admin or not admin.is_admin:
-                return {"success": False, "message": "Only admins can assign LLMs to other users"}
+                return {"success": False, "message": "Only admins can activate LLMs"}
             
-            # Update the LLM's user_id
-            old_user_id = llm.user_id
-            llm.user_id = target_user_id
+            # Activate the LLM and set activated_by
+            llm.is_active = True
+            llm.activated_by = admin_id
             self.db.commit()
             
-            logger.info(f"LLM {llm_id} assigned from user {old_user_id} to user {target_user_id} by admin {admin_id}")
+            logger.info(f"LLM {llm_id} activated by admin {admin_id} for all users")
             return {
                 "success": True, 
-                "message": f"LLM assigned to user {target_user_id} successfully",
+                "message": f"LLM activated for all users",
                 "llm_id": llm_id,
-                "new_owner_id": target_user_id
+                "activated_by": admin_id
             }
         except Exception as e:
             self.db.rollback()
             logger.error(f"Assign LLM failed: {e}")
-            return {"success": False, "message": f"Error assigning LLM: {str(e)}"}
+            return {"success": False, "message": f"Error activating LLM: {str(e)}"}
 
     # --- GET SINGLE LLM ---
 
@@ -387,14 +428,13 @@ class LLM_RegistryRepo:
         """
         Get single LLM details.
         Admin can view any LLM.
-        Normal user can only view their own active LLMs.
+        Normal user can view active LLMs (their own OR activated by anyone).
         """
         try:
             query = self.db.query(RegisterLLM).filter(RegisterLLM.id == llm_id)
             
             if not is_admin:
                 query = query.filter(
-                    RegisterLLM.user_id == user_id,
                     RegisterLLM.is_active == True,  # Only active
                     RegisterLLM.is_deleted == False
                 )
@@ -405,10 +445,10 @@ class LLM_RegistryRepo:
             
             return {
                 "id": llm.id,
-                "user_id": llm.user_id,
+                "activated_by": llm.activated_by,
                 "model_name": llm.model_name,
                 "model_path": llm.model_path,
-                "vram_estimate_gb": llm.vram_estimate_gb,
+                "is_enabled": llm.is_enabled,
                 "is_active": llm.is_active,
                 "is_deleted": llm.is_deleted,
                 "created_at": llm.created_at.isoformat() if llm.created_at else None,
@@ -419,6 +459,34 @@ class LLM_RegistryRepo:
             return None
 
     # --- GET ALL AVAILABLE LLMS (For Assignment) ---
+
+    def set_global_llm(self, llm_id: int, is_global: bool) -> Dict[str, Any]:
+        """
+        Set an LLM as global (admin only).
+        This method is deprecated - use set_llm_active instead.
+        """
+        try:
+            llm = self.db.query(RegisterLLM).filter(RegisterLLM.id == llm_id).first()
+            if not llm:
+                return {"success": False, "message": "LLM not found"}
+            
+            if llm.is_deleted:
+                return {"success": False, "message": "Cannot set a deleted LLM as global"}
+            
+            llm.is_active = is_global
+            self.db.commit()
+            
+            status = "active" if is_global else "inactive"
+            return {
+                "success": True, 
+                "message": f"LLM set as {status}",
+                "llm_id": llm_id,
+                "is_active": is_global
+            }
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Set global LLM failed: {e}")
+            return {"success": False, "message": f"Error: {str(e)}"}
 
     def get_all_llms_for_admin(self, admin_id: int) -> List[Dict[str, Any]]:
         """
@@ -434,10 +502,9 @@ class LLM_RegistryRepo:
             return [
                 {
                     "id": llm.id,
-                    "user_id": llm.user_id,
+                    "activated_by": llm.activated_by,
                     "model_name": llm.model_name,
                     "model_path": llm.model_path,
-                    "vram_estimate_gb": llm.vram_estimate_gb,
                     "is_active": llm.is_active,
                     "is_deleted": llm.is_deleted,
                     "created_at": llm.created_at.isoformat() if llm.created_at else None
@@ -446,4 +513,27 @@ class LLM_RegistryRepo:
             ]
         except Exception as e:
             logger.error(f"Get all LLMs for admin failed: {e}")
+            return []
+
+    def get_llms_with_owners(self, is_admin: bool) -> List[Dict[str, Any]]:
+        """Get all LLMs with their activated_by info (admin only)"""
+        if not is_admin:
+            return []
+        
+        try:
+            models = self.db.query(RegisterLLM).filter(RegisterLLM.is_deleted == False).all()
+            result = []
+            for model in models:
+                user = self.db.query(User).filter(User.id == model.activated_by).first()
+                result.append({
+                    "llm_id": model.id,
+                    "model_name": model.model_name,
+                    "model_path": model.model_path,
+                    "activated_by": model.activated_by,
+                    "activated_by_username": user.username if user else None,
+                    "is_active": model.is_active
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Get LLMs with owners failed: {e}")
             return []

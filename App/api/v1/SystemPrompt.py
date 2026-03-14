@@ -1,18 +1,23 @@
-from typing import Dict, Any
+from typing import Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+import json
+import asyncio
 
 from App.api.dependencies.sqlite_connector import get_db
 from App.api.dependencies.auth import get_current_user
 from App.repository.systemPromptREP import SystemPromptRepo
 from App.schemas.systemPromptSchemas import SystemPromptCreate, SystemPromptUpdate
+from App.api.dependencies.lcConnector import get_llm_connector
 
-router = APIRouter(prefix="/prompt", tags=["SystemPrompt"])
+router = APIRouter(prefix="/prompt" )
 
 
 @router.post("/create")
 async def create_prompt(
-    prompt_data: SystemPromptCreate,
+    role: str = Query(..., description="Role name for this prompt (e.g., 'Analyst', 'Assistant')"),
+    prompt: str = Query(..., description="The system prompt text"),
     db: Session = Depends(get_db),
     current_user: Dict = Depends(get_current_user)
 ):
@@ -25,9 +30,8 @@ async def create_prompt(
     repo = SystemPromptRepo(db)
     result = repo.create_prompt(
         user_id=current_user["id"],
-        model_id=prompt_data.model_id,
-        persona_name=prompt_data.persona_name,
-        prompt_text=prompt_data.prompt_text
+        role=role,
+        prompt=prompt
     )
     
     if not result["success"]:
@@ -72,7 +76,9 @@ async def get_prompt_details(
 @router.patch("/update/{prompt_id}")
 async def update_prompt(
     prompt_id: int,
-    update_data: SystemPromptUpdate,
+    role: str = Query(None, description="New role name"),
+    prompt: str = Query(None, description="New prompt text"),
+    is_active: bool = Query(None, description="Set active status"),
     db: Session = Depends(get_db),
     current_user: Dict = Depends(get_current_user)
 ):
@@ -87,12 +93,12 @@ async def update_prompt(
     
     # Build update dict (exclude None values)
     update_dict = {}
-    if update_data.persona_name is not None:
-        update_dict["persona_name"] = update_data.persona_name
-    if update_data.prompt_text is not None:
-        update_dict["prompt_text"] = update_data.prompt_text
-    if update_data.is_active is not None:
-        update_dict["is_active"] = update_data.is_active
+    if role is not None:
+        update_dict["role"] = role
+    if prompt is not None:
+        update_dict["prompt"] = prompt
+    if is_active is not None:
+        update_dict["is_active"] = is_active
     
     if not update_dict:
         raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -143,26 +149,6 @@ async def assign_prompt_to_user(
     
     repo = SystemPromptRepo(db)
     result = repo.assign_prompt_to_user(prompt_id, target_user_id, current_user["id"])
-    
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail=result["message"])
-    
-    return result
-
-
-@router.post("/admin/assign-to-model")
-async def assign_prompt_to_model(
-    prompt_id: int = Query(..., description="ID of the prompt"),
-    model_id: int = Query(..., description="ID of the model to assign to"),
-    db: Session = Depends(get_db),
-    current_user: Dict = Depends(get_current_user)
-):
-    """Admin: Assign prompt to a different model"""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can reassign prompts")
-    
-    repo = SystemPromptRepo(db)
-    result = repo.assign_prompt_to_model(prompt_id, model_id, current_user["id"])
     
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["message"])
@@ -231,29 +217,7 @@ async def get_users_with_prompts(
     return {"users_with_prompts": result}
 
 
-@router.get("/admin/models-with-prompts")
-async def get_models_with_prompts(
-    db: Session = Depends(get_db),
-    current_user: Dict = Depends(get_current_user)
-):
-    """Admin: Get all models with their assigned prompts"""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can access this")
-    
-    repo = SystemPromptRepo(db)
-    result = repo.get_all_models_with_prompts(is_admin=True)
-    return {"models_with_prompts": result}
 
 
-@router.get("/admin/llms-with-owners")
-async def get_llms_with_owners(
-    db: Session = Depends(get_db),
-    current_user: Dict = Depends(get_current_user)
-):
-    """Admin: Get all LLMs with their owners"""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can access this")
-    
-    repo = SystemPromptRepo(db)
-    result = repo.get_llms_with_owners(is_admin=True)
-    return {"llms_with_owners": result}
+# ==================== PERSONA ENDPOINTS (MOVED TO langChainsRoutes) ====================
+
