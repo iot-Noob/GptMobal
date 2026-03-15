@@ -37,10 +37,16 @@ async def summarize_context(state: GraphState):
         if not model:
             return {"summary": state.get("summary", "")}
             
-        history_to_summarize = messages[:-5]
+        to_summarize = messages[:-5]
+        existing_summary = state.get("summary", "")
+        summary_content = "\n".join([f"{m.type}: {m.content}" for m in to_summarize])
+        
+        if existing_summary:
+            summary_content = f"Previous Summary: {existing_summary}\n\nRecent History:\n{summary_content}"
+
         summary_prompt = [
-            SystemMessage(content="Summarize the following conversation history briefly to preserve context:"),
-            HumanMessage(content=str(history_to_summarize))
+            SystemMessage(content="You are a context manager. Merge the previous summary and the recent conversation history into a single, concise paragraph that captures ALL key facts (names, preferences, topics, decisions). Don't lose old info."),
+            HumanMessage(content=summary_content)
         ]
         
         try:
@@ -70,6 +76,10 @@ async def call_model(state: GraphState):
         full_prompt.append(SystemMessage(content=f"Context Summary: {state['summary']}"))
         
     full_prompt.extend(messages)
+    
+    logger.info(f"Graph Prompt - Session: {state['session_id']}, Iteration: {state.get('iteration', 0)}, Message Count: {len(full_prompt)}")
+    for i, m in enumerate(full_prompt):
+        logger.debug(f"Msg {i} - {m.type}: {m.content[:50]}...")
         
     try:
         response = await model.ainvoke(full_prompt)
@@ -80,38 +90,64 @@ async def call_model(state: GraphState):
 
 async def reflect_on_response(state: GraphState):
     """
-    Self-correction node. Checks if the response matches persona instructions.
-    Only runs once to avoid infinite loops.
+    Self-correction node. Now history-aware.
+    Checks if the response matches persona instructions AND is contextually correct.
     """
-    if state.get("iteration", 0) > 1: # Already refined once
+    if state.get("iteration", 0) > 1: # Only one refinement attempt
         return END
 
     model = lc_connector.get_central_model()
-    last_response = state["messages"][-1].content
+    messages = state["messages"] # History + Newest Turn
     persona_prompt = state["persona_prompt"]
+    summary = state.get("summary", "")
     
-    # Internal critique prompt
+    # Internal critique prompt with FULL CONTEXT
+    # The critic needs to know what was said before to judge accurately
+    eval_context = f"Persona: {persona_prompt}\n"
+    if summary:
+        eval_context += f"Background Context: {summary}\n"
+    
+    # Convert history messages to a readable string for the critic
+    history_str = "\n".join([f"{m.type}: {m.content}" for m in messages])
+    
     critique_prompt = [
-        SystemMessage(content=f"You are a quality controller. The user persona is: {persona_prompt}"),
-        HumanMessage(content=f"Evaluate this response for accuracy and persona adherence: '{last_response}'. If it is good, reply 'PASSED'. If it needs improvement (e.g. out of character, incorrect), reply 'REDO' followed by the reason.")
+        SystemMessage(content=f"You are a Quality Control AI.\n{eval_context}"),
+        HumanMessage(content=f"Evaluate the LAST AI response in this conversation for accuracy, coherence, and persona adherence:\n\n{history_str}\n\nIf the last AI response is correct and fits the persona, reply exactly 'PASSED'. If it is incorrect, halluncinating, or violating persona, reply 'REDO' followed by a short explanation of what to fix.")
     ]
     
     try:
         critique = await model.ainvoke(critique_prompt)
-        if "REDO" in critique.content.upper():
-            logger.info(f"Refinement triggered for session {state['session_id']}")
-            # Add critique to history so model knows what to fix
-            return "model" # Map to 'model' node in edges
-    except:
-        pass
+        content = critique.content.upper()
+        if "REDO" in content:
+            logger.info(f"Refinement triggered for session {state['session_id']} due to: {critique.content}")
+            # We return a specific update to the state that will be processed
+            # but in conditional_edges, we return the NEXT node.
+            # State updates should happen in nodes. I'll split this.
+            return "critique_to_state"
+    except Exception as e:
+        logger.error(f"Reflection error: {e}")
         
     return END
+
+async def critique_to_state(state: GraphState):
+    """
+    This node simply adds the internal critique back to the message list 
+    to guide the model in the next iteration.
+    """
+    # Note: We don't save this critique to the real DB, it's just for the graph loop.
+    return {"messages": [AIMessage(content="[INTERNAL CRITIQUE: Your last response was slightly off. Please refine it while strictly adhering to the persona and the conversation history above.")]}
 
 async def save_interaction(state: GraphState):
     """Save the latest round to the persistent database."""
     session_id = state["session_id"]
     messages = state["messages"]
+    summary = state.get("summary")
     
+    # Save summary to DB if it exists
+    if summary:
+        await lc_connector.update_session_summary(session_id, summary)
+
+    # Persistence of messages to message_store
     if len(messages) >= 2:
         last_msg = messages[-1]
         prev_msg = messages[-2]
@@ -126,21 +162,23 @@ async def save_interaction(state: GraphState):
 builder = StateGraph(GraphState)
 builder.add_node("summarize", summarize_context)
 builder.add_node("model", call_model)
+builder.add_node("apply_critique", critique_to_state) # Added internal node
 builder.add_node("save", save_interaction)
 
 builder.add_edge(START, "summarize")
 builder.add_edge("summarize", "model")
 
-# Add conditional logic for Reflection/Accuracy
+# Conditional logic for Reflection/Accuracy
 builder.add_conditional_edges(
     "model",
     reflect_on_response,
     {
-        "model": "model", # Loop back to model for refinement
-        END: "save"       # Or proceed to save
+        "critique_to_state": "apply_critique", 
+        END: "save"
     }
 )
 
+builder.add_edge("apply_critique", "model") # Loop back to model after adding critique
 builder.add_edge("save", END)
 
 # Compile
@@ -153,6 +191,7 @@ class GraphEngine:
     async def run(self, session_id: str, user_id: int, user_message: str, persona_id: Optional[int] = None):
         """Run the graph orchestration with Persona and Memory."""
         history = await lc_connector.get_conversation_history(session_id, limit=15) or []
+        summary = await lc_connector.get_session_summary(session_id) or ""
         
         # 1. ALWAYS Refresh Persona from DB for accuracy
         persona_prompt = "You are a helpful AI assistant."
@@ -171,7 +210,7 @@ class GraphEngine:
             "user_id": user_id,
             "persona_id": persona_id,
             "persona_prompt": persona_prompt,
-            "summary": "",
+            "summary": summary,
             "iteration": 0
         }
         
@@ -183,10 +222,10 @@ class GraphEngine:
 
     async def astream(self, session_id: str, user_id: int, user_message: str, persona_id: Optional[int] = None):
         """
-        Stream orchestration. 
-        Note: The reflection loop is bypassed in raw streaming for lower latency.
+        Stream orchestration (Context Aware).
         """
         history = await lc_connector.get_conversation_history(session_id, limit=10) or []
+        summary = await lc_connector.get_session_summary(session_id) or ""
         
         persona_prompt = "You are a helpful AI assistant."
         db = SessionLocal()
@@ -197,8 +236,14 @@ class GraphEngine:
         finally:
             db.close()
 
-        # Build full contextual prompt
-        messages = [SystemMessage(content=persona_prompt)] + history + [HumanMessage(content=user_message)]
+        # Build full contextual prompt with summary and history
+        messages = [SystemMessage(content=persona_prompt)]
+        if summary:
+            messages.append(SystemMessage(content=f"Background conversation summary: {summary}"))
+        
+        messages.extend(history)
+        messages.append(HumanMessage(content=user_message))
+        
         model = lc_connector.get_central_model()
         
         if not model:

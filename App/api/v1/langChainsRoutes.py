@@ -413,16 +413,32 @@ async def get_my_conversations(
 
 @chain_route.get("/history")
 async def get_formatted_history(
+    session_id: Optional[str] = Query(None, description="Specific Session ID to retrieve"),
     target_user_id: Optional[int] = Query(None, description="Target User ID (Admin only)"),
     current_user: Dict = Depends(get_current_user)
 ):
     """
-    Get full chat history in nested format.
-    - User: Gets their own history.
-    - Admin: Can get all (target_user_id=None) or specific user's history.
+    Get chat history.
+    - User: Gets their own sessions (optionally filtered by session_id).
+    - Admin: Can get any session or any user's history.
     """
     connector = get_llm_connector()
     is_admin = str(current_user.get("role", "")).lower() == "admin"
+    
+    # CASE 1: Specific Session ID requested
+    if session_id:
+        # Security check for non-admins
+        if not is_admin:
+            if not connector.validate_session_ownership(session_id, current_user["id"]):
+                raise HTTPException(status_code=403, detail="Unauthorized access to this session")
+        
+        # Fetch the single session history
+        history = await connector.get_conversation_history(session_id, as_dict=True)
+        if history is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {session_id: {f"msg_{i}": m for i, m in enumerate(history)}}
+
+    # CASE 2: Multi-session history
     history = await connector.get_formatted_history(
         user_id=current_user["id"],
         is_admin=is_admin,

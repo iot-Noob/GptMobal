@@ -635,6 +635,38 @@ class LcConnector:
         finally:
             db.close()
     
+    async def get_session_summary(self, session_id: str) -> Optional[str]:
+        """Get the stored summary for a session (Async)."""
+        def _get():
+            db = SessionLocal()
+            try:
+                session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
+                return session.summary if session else None
+            finally:
+                db.close()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.thread_pool, _get)
+
+    async def update_session_summary(self, session_id: str, summary: str) -> bool:
+        """Update the stored summary for a session (Async)."""
+        def _update():
+            db = SessionLocal()
+            try:
+                session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
+                if session:
+                    session.summary = summary
+                    db.commit()
+                    return True
+                return False
+            except Exception as e:
+                logger.error(f"Error updating session summary: {e}")
+                db.rollback()
+                return False
+            finally:
+                db.close()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.thread_pool, _update)
+
     # ==================== CHAT COMPLETION ====================
     
     async def chat(self, 
