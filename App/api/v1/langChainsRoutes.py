@@ -228,15 +228,27 @@ async def get_my_personas(
     db: Session = Depends(get_db),
     current_user: Dict = Depends(get_current_user)
 ):
-    """Get personas assigned to current user."""
+    """Get personas assigned to or owned by current user."""
+    # Personas assigned via UserPersona
     user_personas = db.query(UserPersona).filter(
         UserPersona.user_id == current_user["id"]
     ).all()
     
+    assigned_ids = {up.persona_id for up in user_personas}
+    
+    # Personas owned by the user directly
+    owned_prompts = db.query(SystemPrompt).filter(
+        SystemPrompt.user_id == current_user["id"],
+        SystemPrompt.is_deleted == False
+    ).all()
+    
+    for p in owned_prompts:
+        assigned_ids.add(p.id)
+        
     result = []
-    for up in user_personas:
+    for pid in assigned_ids:
         prompt = db.query(SystemPrompt).filter(
-            SystemPrompt.id == up.persona_id,
+            SystemPrompt.id == pid,
             SystemPrompt.is_deleted == False
         ).first()
         if prompt:
@@ -347,14 +359,23 @@ async def chat(
     if not persona:
         raise HTTPException(status_code=404, detail="Persona not found or deleted")
     
-    # Check access
+    # Check access (Admin, Owner, or Assigned)
+    is_admin = str(current_user.get("role", "")).lower() == "admin"
+    is_owner = int(persona.user_id) == int(current_user["id"])
+    
     user_assignment = db.query(UserPersona).filter(
-        UserPersona.user_id == current_user["id"],
-        UserPersona.persona_id == persona_id
+        UserPersona.user_id == int(current_user["id"]),
+        UserPersona.persona_id == int(persona_id)
     ).first()
     
-    if current_user.get("role") != "admin" and not user_assignment:
-        raise HTTPException(status_code=403, detail="No access to this persona")
+    has_access = is_admin or is_owner or (user_assignment is not None)
+        
+    if not has_access:
+        logger.warning(f"Access denied: user_id={current_user['id']}, role={current_user.get('role')}, persona_id={persona_id}")
+        raise HTTPException(
+            status_code=403, 
+            detail=f"No access to this persona (ID: {persona_id}). Admin must assign it to you."
+        )
     
     connector = get_llm_connector()
     
@@ -381,6 +402,66 @@ async def chat(
     }
 
 
+@chain_route.get("/my-conversations")
+async def get_my_conversations(
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get all chat sessions for the current user."""
+    connector = get_llm_connector()
+    sessions = connector.get_user_conversations(current_user["id"])
+    return {"conversations": sessions}
+
+
+@chain_route.get("/history")
+async def get_formatted_history(
+    target_user_id: Optional[int] = Query(None, description="Target User ID (Admin only)"),
+    current_user: Dict = Depends(get_current_user)
+):
+    """
+    Get full chat history in nested format.
+    - User: Gets their own history.
+    - Admin: Can get all (target_user_id=None) or specific user's history.
+    """
+    connector = get_llm_connector()
+    is_admin = str(current_user.get("role", "")).lower() == "admin"
+    history = connector.get_formatted_history(
+        user_id=current_user["id"],
+        is_admin=is_admin,
+        target_user_id=target_user_id
+    )
+    return history
+
+
+@chain_route.delete("/session/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Soft delete a chat session (Normal users only their own, Admins any)."""
+    connector = get_llm_connector()
+    is_admin = str(current_user.get("role", "")).lower() == "admin"
+    success = connector.soft_delete_session(session_id, current_user["id"], is_admin)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or already deleted")
+    return {"message": "Session soft-deleted successfully"}
+
+
+@chain_route.post("/session/{session_id}/restore")
+async def restore_chat_session(
+    session_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Admin: Restore a soft-deleted session."""
+    if str(current_user.get("role", "")).lower() != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can restore deleted sessions")
+    
+    connector = get_llm_connector()
+    success = connector.restore_session(session_id, current_user["id"], is_admin=True)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"message": "Session restored successfully"}
+
+
 @chain_route.post("/chat/stream")
 async def chat_stream(
     persona_id: int = Query(..., description="Persona ID"),
@@ -397,33 +478,63 @@ async def chat_stream(
     if not persona:
         raise HTTPException(status_code=404, detail="Persona not found")
     
+    # Check access (Admin, Owner, or Assigned)
+    is_admin = str(current_user.get("role", "")).lower() == "admin"
+    is_owner = int(persona.user_id) == int(current_user["id"])
+    
     user_assignment = db.query(UserPersona).filter(
-        UserPersona.user_id == current_user["id"],
-        UserPersona.persona_id == persona_id
+        UserPersona.user_id == int(current_user["id"]),
+        UserPersona.persona_id == int(persona_id)
     ).first()
     
-    if current_user.get("role") != "admin" and not user_assignment:
-        raise HTTPException(status_code=403, detail="No access to this persona")
+    has_access = is_admin or is_owner or (user_assignment is not None)
+        
+    if not has_access:
+        logger.warning(f"Stream Access denied: user_id={current_user['id']}, role={current_user.get('role')}, persona_id={persona_id}")
+        raise HTTPException(
+            status_code=403, 
+            detail=f"No access to this persona (ID: {persona_id}). Admin must assign it to you."
+        )
     
     connector = get_llm_connector()
     
     if not connector._central_model:
         raise HTTPException(status_code=400, detail="No central model loaded")
+        
+    # Enforce session ownership if provided
+    if session_id:
+        if not connector.validate_session_ownership(session_id, current_user["id"]):
+            raise HTTPException(
+                status_code=403, 
+                detail="Unauthorized: This session does not belong to you or has been deleted."
+            )
     
     async def generate():
-        if not session_id:
-            session_id = connector.start_conversation(current_user["id"], template_id=str(persona_id))
-            connector.add_message(session_id, "system", persona.prompt)
+        local_session_id = session_id
+        if not local_session_id:
+            local_session_id = connector.start_conversation(current_user["id"], template_id=str(persona_id))
+            connector.add_message(local_session_id, "system", persona.prompt)
         
-        messages = [{"role": "user", "content": message}]
+        # Enforce history usage in stream
+        history = connector.get_conversation_history(local_session_id, as_dict=True)
+        inference_messages = []
+        if history:
+            inference_messages.extend(history)
+        inference_messages.append({"role": "user", "content": message})
         
         try:
-            async for chunk in connector._central_model.astream(messages):
+            full_response = ""
+            async for chunk in connector._central_model.astream(inference_messages):
                 content = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                yield f"data: {json.dumps({'content': content})}\n\n"
-                connector.add_message(session_id, "user", message)
-                connector.add_message(session_id, "assistant", content)
+                full_response += content
+                yield f"data: {json.dumps({'content': content, 'session_id': local_session_id})}\n\n"
+            
+            # Save final interactions
+            connector.add_message(local_session_id, "user", message)
+            connector.add_message(local_session_id, "assistant", full_response)
+                
         except Exception as e:
+            logger.error(f"Stream error: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
         
         yield "data: [DONE]\n\n"

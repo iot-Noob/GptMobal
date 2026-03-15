@@ -14,9 +14,13 @@ from datetime import datetime
 import hashlib
 import uuid
 import os
+import logging
+from sqlalchemy import or_
 
 from App.core.LoggingInit import get_core_logger
 from App.core.settings import settings
+from App.api.dependencies.sqlite_connector import SessionLocal
+from App.api.databases.Tables import ChatSession, SystemPrompt
 
 logger = get_core_logger(__name__)
 
@@ -139,6 +143,19 @@ class LcConnector:
                 raise
         
         return self._session_stores[session_id]
+    
+    def validate_session_ownership(self, session_id: str, user_id: int) -> bool:
+        """Verify if a session belongs to a user."""
+        db = SessionLocal()
+        try:
+            session = db.query(ChatSession).filter(
+                ChatSession.session_id == session_id,
+                ChatSession.user_id == user_id,
+                ChatSession.is_deleted == False
+            ).first()
+            return session is not None
+        finally:
+            db.close()
     
     @property
     def thread_pool(self):
@@ -356,17 +373,39 @@ class LcConnector:
     
     def start_conversation(self, user_id: int, template_id: str = None) -> str:
         """
-        Start a new conversation session.
+        Start a new conversation session and persist ownership mapping.
         
         Returns:
             str: Session ID
         """
         session_id = str(uuid.uuid4())
         
-        # Get user's preferred template
+        # Get user's preferred template if not provided
         if template_id is None:
             template_id = self.get_user_preference(user_id, "template_id")
         
+        # Persist session mapping in database
+        db = SessionLocal()
+        try:
+            # Try to parse template_id as persona_id (int)
+            p_id = None
+            if template_id and str(template_id).isdigit():
+                p_id = int(template_id)
+            
+            new_session = ChatSession(
+                session_id=session_id,
+                user_id=user_id,
+                persona_id=p_id
+            )
+            db.add(new_session)
+            db.commit()
+            logger.info(f"✅ Persisted session {session_id} for user {user_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to persist session mapping: {e}")
+            db.rollback()
+        finally:
+            db.close()
+
         # Get or create session store
         store = self._get_session_store(session_id)
         
@@ -492,23 +531,127 @@ class LcConnector:
         except Exception as e:
             logger.error(f"Failed to clear conversation history: {e}")
     
-    def get_user_conversations(self, user_id: int) -> List[Dict[str, Any]]:
+    def get_user_conversations(self, user_id: int, include_deleted: bool = False) -> List[Dict[str, Any]]:
         """
-        Get all conversations for a user.
+        Get all conversations for a user from database.
         
         Args:
             user_id: User ID
+            include_deleted: Whether to include soft-deleted sessions
             
         Returns:
             List of conversation metadata
         """
-        if not hasattr(self, '_session_metadata'):
+        db = SessionLocal()
+        try:
+            query = db.query(ChatSession).filter(ChatSession.user_id == user_id)
+            if not include_deleted:
+                query = query.filter(ChatSession.is_deleted == False)
+            
+            sessions = query.all()
+            return [
+                {
+                    "session_id": s.session_id,
+                    "persona_id": s.persona_id,
+                    "is_deleted": s.is_deleted,
+                    "created_at": s.created_at.isoformat() if s.created_at else None
+                }
+                for s in sessions
+            ]
+        except Exception as e:
+            logger.error(f"Error fetching user conversations: {e}")
             return []
-        
-        return [
-            metadata for metadata in self._session_metadata.values()
-            if metadata.get("user_id") == user_id
-        ]
+        finally:
+            db.close()
+
+    def get_formatted_history(self, user_id: int, is_admin: bool = False, target_user_id: Optional[int] = None) -> Dict:
+        """
+        Get chat history in the requested nested format.
+        """
+        db = SessionLocal()
+        try:
+            if is_admin and target_user_id:
+                # Admin view for specific user
+                sessions = db.query(ChatSession).filter(
+                    ChatSession.user_id == target_user_id,
+                    ChatSession.is_deleted == False
+                ).all()
+            elif is_admin and not target_user_id:
+                # Admin view all users
+                sessions = db.query(ChatSession).filter(ChatSession.is_deleted == False).all()
+            else:
+                # Normal user view
+                sessions = db.query(ChatSession).filter(
+                    ChatSession.user_id == user_id,
+                    ChatSession.is_deleted == False
+                ).all()
+
+            result = {}
+            for s in sessions:
+                history = self.get_conversation_history(s.session_id, as_dict=True)
+                session_data = {}
+                for idx, msg in enumerate(history):
+                    session_data[f"msg_{idx}"] = msg
+                
+                if is_admin and not target_user_id:
+                    # Nested by user_id
+                    u_id = str(s.user_id)
+                    if u_id not in result: result[u_id] = {}
+                    result[u_id][s.session_id] = session_data
+                else:
+                    # Nested by session_id
+                    result[s.session_id] = session_data
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error formatting history: {e}")
+            return {"error": str(e)}
+        finally:
+            db.close()
+
+    def soft_delete_session(self, session_id: str, user_id: int, is_admin: bool = False) -> bool:
+        """Soft delete a chat session."""
+        db = SessionLocal()
+        try:
+            query = db.query(ChatSession).filter(ChatSession.session_id == session_id)
+            if not is_admin:
+                query = query.filter(ChatSession.user_id == user_id)
+            
+            session = query.first()
+            if session:
+                session.is_deleted = True
+                session.deleted_at = datetime.now()
+                db.commit()
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Soft delete error: {e}")
+            db.rollback()
+            return False
+        finally:
+            db.close()
+
+    def restore_session(self, session_id: str, user_id: int, is_admin: bool = False) -> bool:
+        """Restore a soft-deleted chat session."""
+        db = SessionLocal()
+        try:
+            query = db.query(ChatSession).filter(ChatSession.session_id == session_id)
+            if not is_admin:
+                query = query.filter(ChatSession.user_id == user_id)
+            
+            session = query.first()
+            if session:
+                session.is_deleted = False
+                session.deleted_at = None
+                db.commit()
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Restore session error: {e}")
+            db.rollback()
+            return False
+        finally:
+            db.close()
     
     # ==================== CHAT COMPLETION ====================
     
@@ -569,13 +712,18 @@ class LcConnector:
                 self.prompt_templates[template_id].get("usage_count", 0) + 1
         
         # Add conversation history if session exists
-        if session_id and save_history:
-            history = self.get_conversation_history(session_id, as_dict=True)
-            if history:
-                # Filter out system messages if we're adding a new one
-                if template_id:
-                    history = [m for m in history if m["role"] != "system"]
-                inference_messages.extend(history)
+        if session_id:
+            # Enforce ownership check
+            if user_id and not self.validate_session_ownership(session_id, user_id):
+                return {"error": "Unauthorized: This session does not belong to you or has been deleted."}
+
+            if save_history:
+                history = self.get_conversation_history(session_id, as_dict=True)
+                if history:
+                    # Filter out system messages if we're adding a new one
+                    if template_id:
+                        history = [m for m in history if m["role"] != "system"]
+                    inference_messages.extend(history)
         
         # Add current messages
         inference_messages.extend(messages)

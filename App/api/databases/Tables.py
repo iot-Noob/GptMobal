@@ -55,5 +55,17 @@ class UserPersona(Base):
     persona_id = Column(Integer, ForeignKey("system_prompts.id"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+# Chat Sessions mapping
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    persona_id = Column(Integer, ForeignKey("system_prompts.id"), nullable=True)
+    is_deleted = Column(Boolean, default=False)
+    deleted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
 Base.metadata.create_all(bind=engine)
 

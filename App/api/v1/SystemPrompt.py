@@ -215,9 +215,4 @@ async def get_users_with_prompts(
     repo = SystemPromptRepo(db)
     result = repo.get_all_users_with_prompts(is_admin=True)
     return {"users_with_prompts": result}
-
-
-
-
-# ==================== PERSONA ENDPOINTS (MOVED TO langChainsRoutes) ====================
-
+ 
