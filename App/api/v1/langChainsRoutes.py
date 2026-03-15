@@ -384,12 +384,12 @@ async def chat(
     
     if not session_id:
         session_id = connector.start_conversation(current_user["id"], template_id=str(persona_id))
-        connector.add_message(session_id, "system", persona.prompt)
     
-    result = await connector.chat(
-        messages=[{"role": "user", "content": message}],
+    result = await connector.chat_with_graph(
+        message=message,
         user_id=current_user["id"],
-        session_id=session_id
+        session_id=session_id,
+        persona_id=persona_id
     )
     
     if "error" in result:
@@ -397,8 +397,7 @@ async def chat(
     
     return {
         "response": result["content"],
-        "session_id": session_id,
-        "tokens": result.get("tokens")
+        "session_id": session_id
     }
 
 
@@ -510,28 +509,20 @@ async def chat_stream(
             )
     
     async def generate():
-        local_session_id = session_id
-        if not local_session_id:
-            local_session_id = connector.start_conversation(current_user["id"], template_id=str(persona_id))
-            connector.add_message(local_session_id, "system", persona.prompt)
-        
-        # Enforce history usage in stream
-        history = connector.get_conversation_history(local_session_id, as_dict=True)
-        inference_messages = []
-        if history:
-            inference_messages.extend(history)
-        inference_messages.append({"role": "user", "content": message})
+        nonlocal session_id
+        if not session_id:
+            session_id = connector.start_conversation(current_user["id"], template_id=str(persona_id))
         
         try:
+            from App.api.dependencies.graph_engine import graph_engine
             full_response = ""
-            async for chunk in connector._central_model.astream(inference_messages):
-                content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            async for content in graph_engine.astream(session_id, current_user["id"], message, persona_id):
                 full_response += content
-                yield f"data: {json.dumps({'content': content, 'session_id': local_session_id})}\n\n"
+                yield f"data: {json.dumps({'content': content, 'session_id': session_id})}\n\n"
             
-            # Save final interactions
-            connector.add_message(local_session_id, "user", message)
-            connector.add_message(local_session_id, "assistant", full_response)
+            # Post-stream persistence (since we bypassed the graph 'save' node)
+            connector.add_message(session_id, "user", message)
+            connector.add_message(session_id, "assistant", full_response)
                 
         except Exception as e:
             logger.error(f"Stream error: {e}")

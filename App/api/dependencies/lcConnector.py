@@ -21,6 +21,7 @@ from App.core.LoggingInit import get_core_logger
 from App.core.settings import settings
 from App.api.dependencies.sqlite_connector import SessionLocal
 from App.api.databases.Tables import ChatSession, SystemPrompt
+# from App.api.dependencies.graph_engine import graph_engine # Avoid circular import
 
 logger = get_core_logger(__name__)
 
@@ -467,13 +468,14 @@ class LcConnector:
             logger.error(f"Failed to add message: {e}")
             return False
     
-    def get_conversation_history(self, session_id: str, as_dict: bool = False) -> Optional[List]:
+    def get_conversation_history(self, session_id: str, as_dict: bool = False, limit: Optional[int] = None) -> Optional[List]:
         """
         Get conversation history for a session.
         
         Args:
             session_id: Session ID
             as_dict: If True, return as list of dicts, else return LangChain messages
+            limit: Only return last N messages
             
         Returns:
             List of messages or None if session not found
@@ -482,6 +484,13 @@ class LcConnector:
             store = self._get_session_store(session_id)
             messages = store.messages
             
+            if limit:
+                # Keep system message if it's the first one, then last N-1
+                if messages and isinstance(messages[0], SystemMessage):
+                    messages = [messages[0]] + messages[-(limit-1):] if limit > 1 else [messages[0]]
+                else:
+                    messages = messages[-limit:]
+
             if as_dict:
                 return [
                     {
@@ -750,6 +759,21 @@ class LcConnector:
                 
         except Exception as e:
             logger.error(f"Chat error: {e}")
+            return {"error": str(e)}
+
+    async def chat_with_graph(self, 
+                             message: str,
+                             user_id: int,
+                             session_id: str,
+                             persona_id: Optional[int] = None,
+                             **kwargs):
+        """Execute chat via LangGraph orchestration."""
+        from App.api.dependencies.graph_engine import graph_engine
+        try:
+            response = await graph_engine.run(session_id, user_id, message, persona_id)
+            return {"content": response}
+        except Exception as e:
+            logger.error(f"Graph execution error: {e}")
             return {"error": str(e)}
     
     async def _generate_response(self, model, messages, session_id, user_id, save_history, **params):
