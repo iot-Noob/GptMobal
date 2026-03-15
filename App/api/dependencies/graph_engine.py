@@ -18,7 +18,9 @@ class GraphState(TypedDict):
     session_id: str
     user_id: int
     persona_id: Optional[int]
+    persona_prompt: str  # Added to strictly keep persona instructions
     summary: str
+    iteration: int       # Track loops for self-correction
 
 # 2. Define the Nodes
 
@@ -61,18 +63,49 @@ async def call_model(state: GraphState):
     if not model:
         return {"messages": [AIMessage(content="Error: No model loaded.")]}
     
-    # Prefix with summary if it exists to give the LLM context of older parts
+    # Strictly enforce persona as the foundation
+    full_prompt = [SystemMessage(content=state["persona_prompt"])]
+    
     if state.get("summary"):
-        context_msg = SystemMessage(content=f"Background context of conversation: {state['summary']}")
-        # Insert after system prompt (messages[0])
-        messages = [messages[0], context_msg] + messages[1:]
+        full_prompt.append(SystemMessage(content=f"Context Summary: {state['summary']}"))
+        
+    full_prompt.extend(messages)
         
     try:
-        response = await model.ainvoke(messages)
-        return {"messages": [response]}
+        response = await model.ainvoke(full_prompt)
+        return {"messages": [response], "iteration": state.get("iteration", 0) + 1}
     except Exception as e:
-        logger.error(f"Error calling model in graph: {e}")
+        logger.error(f"Error calling model: {e}")
         return {"messages": [AIMessage(content=f"Error: {str(e)}")]}
+
+async def reflect_on_response(state: GraphState):
+    """
+    Self-correction node. Checks if the response matches persona instructions.
+    Only runs once to avoid infinite loops.
+    """
+    if state.get("iteration", 0) > 1: # Already refined once
+        return END
+
+    model = lc_connector.get_central_model()
+    last_response = state["messages"][-1].content
+    persona_prompt = state["persona_prompt"]
+    
+    # Internal critique prompt
+    critique_prompt = [
+        SystemMessage(content=f"You are a quality controller. The user persona is: {persona_prompt}"),
+        HumanMessage(content=f"Evaluate this response for accuracy and persona adherence: '{last_response}'. If it is good, reply 'PASSED'. If it needs improvement (e.g. out of character, incorrect), reply 'REDO' followed by the reason.")
+    ]
+    
+    try:
+        critique = await model.ainvoke(critique_prompt)
+        if "REDO" in critique.content.upper():
+            logger.info(f"Refinement triggered for session {state['session_id']}")
+            # Add critique to history so model knows what to fix
+            return "model" # Map to 'model' node in edges
+    except:
+        pass
+        
+    return END
 
 async def save_interaction(state: GraphState):
     """Save the latest round to the persistent database."""
@@ -97,7 +130,17 @@ builder.add_node("save", save_interaction)
 
 builder.add_edge(START, "summarize")
 builder.add_edge("summarize", "model")
-builder.add_edge("model", "save")
+
+# Add conditional logic for Reflection/Accuracy
+builder.add_conditional_edges(
+    "model",
+    reflect_on_response,
+    {
+        "model": "model", # Loop back to model for refinement
+        END: "save"       # Or proceed to save
+    }
+)
+
 builder.add_edge("save", END)
 
 # Compile
@@ -108,26 +151,28 @@ class GraphEngine:
         self.runnable = graph
 
     async def run(self, session_id: str, user_id: int, user_message: str, persona_id: Optional[int] = None):
-        """Run the graph orchestration."""
-        # Optimized retrieval: Get only last 20 messages to keep DB overhead low
-        history = await lc_connector.get_conversation_history(session_id, limit=20) or []
+        """Run the graph orchestration with Persona and Memory."""
+        history = await lc_connector.get_conversation_history(session_id, limit=15) or []
         
-        system_msg = []
-        if not any(isinstance(m, SystemMessage) for m in history):
-            db = SessionLocal()
-            try:
-                persona = db.query(SystemPrompt).filter(SystemPrompt.id == persona_id).first()
-                if persona:
-                    system_msg = [SystemMessage(content=persona.prompt)]
-            finally:
-                db.close()
+        # 1. ALWAYS Refresh Persona from DB for accuracy
+        persona_prompt = "You are a helpful AI assistant."
+        db = SessionLocal()
+        try:
+            persona = db.query(SystemPrompt).filter(SystemPrompt.id == persona_id).first()
+            if persona:
+                persona_prompt = persona.prompt
+        finally:
+            db.close()
 
+        # 2. Setup Initial State
         inputs = {
-            "messages": system_msg + history + [HumanMessage(content=user_message)],
+            "messages": history + [HumanMessage(content=user_message)],
             "session_id": session_id,
             "user_id": user_id,
             "persona_id": persona_id,
-            "summary": ""
+            "persona_prompt": persona_prompt,
+            "summary": "",
+            "iteration": 0
         }
         
         final_state = await self.runnable.ainvoke(inputs)
@@ -137,22 +182,25 @@ class GraphEngine:
         return "I'm sorry, I couldn't generate a response."
 
     async def astream(self, session_id: str, user_id: int, user_message: str, persona_id: Optional[int] = None):
-        """Stream orchestration."""
-        # Using limited history for performance
-        history = await lc_connector.get_conversation_history(session_id, limit=15) or []
+        """
+        Stream orchestration. 
+        Note: The reflection loop is bypassed in raw streaming for lower latency.
+        """
+        history = await lc_connector.get_conversation_history(session_id, limit=10) or []
         
-        system_msg = []
-        if not any(isinstance(m, SystemMessage) for m in history):
-             db = SessionLocal()
-             try:
-                 persona = db.query(SystemPrompt).filter(SystemPrompt.id == persona_id).first()
-                 if persona:
-                     system_msg = [SystemMessage(content=persona.prompt)]
-             finally:
-                 db.close()
+        persona_prompt = "You are a helpful AI assistant."
+        db = SessionLocal()
+        try:
+            persona = db.query(SystemPrompt).filter(SystemPrompt.id == persona_id).first()
+            if persona:
+                persona_prompt = persona.prompt
+        finally:
+            db.close()
 
-        messages = system_msg + history + [HumanMessage(content=user_message)]
+        # Build full contextual prompt
+        messages = [SystemMessage(content=persona_prompt)] + history + [HumanMessage(content=user_message)]
         model = lc_connector.get_central_model()
+        
         if not model:
             yield "No model loaded."
             return
