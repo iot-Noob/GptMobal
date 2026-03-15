@@ -84,8 +84,8 @@ async def save_interaction(state: GraphState):
         prev_msg = messages[-2]
         
         if isinstance(last_msg, AIMessage) and isinstance(prev_msg, HumanMessage):
-             lc_connector.add_message(session_id, "user", prev_msg.content)
-             lc_connector.add_message(session_id, "assistant", last_msg.content)
+             await lc_connector.add_message(session_id, "user", prev_msg.content)
+             await lc_connector.add_message(session_id, "assistant", last_msg.content)
             
     return {"messages": messages}
 
@@ -110,7 +110,7 @@ class GraphEngine:
     async def run(self, session_id: str, user_id: int, user_message: str, persona_id: Optional[int] = None):
         """Run the graph orchestration."""
         # Optimized retrieval: Get only last 20 messages to keep DB overhead low
-        history = lc_connector.get_conversation_history(session_id, limit=20) or []
+        history = await lc_connector.get_conversation_history(session_id, limit=20) or []
         
         system_msg = []
         if not any(isinstance(m, SystemMessage) for m in history):
@@ -139,7 +139,7 @@ class GraphEngine:
     async def astream(self, session_id: str, user_id: int, user_message: str, persona_id: Optional[int] = None):
         """Stream orchestration."""
         # Using limited history for performance
-        history = lc_connector.get_conversation_history(session_id, limit=15) or []
+        history = await lc_connector.get_conversation_history(session_id, limit=15) or []
         
         system_msg = []
         if not any(isinstance(m, SystemMessage) for m in history):

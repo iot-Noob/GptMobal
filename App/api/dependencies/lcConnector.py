@@ -372,7 +372,7 @@ class LcConnector:
     
     # ==================== CONVERSATION HISTORY ====================
     
-    def start_conversation(self, user_id: int, template_id: str = None) -> str:
+    async def start_conversation(self, user_id: int, template_id: str = None) -> str:
         """
         Start a new conversation session and persist ownership mapping.
         
@@ -381,39 +381,42 @@ class LcConnector:
         """
         session_id = str(uuid.uuid4())
         
-        # Get user's preferred template if not provided
-        if template_id is None:
-            template_id = self.get_user_preference(user_id, "template_id")
-        
-        # Persist session mapping in database
-        db = SessionLocal()
-        try:
-            # Try to parse template_id as persona_id (int)
-            p_id = None
-            if template_id and str(template_id).isdigit():
-                p_id = int(template_id)
+        def _persist():
+            # Get user's preferred template if not provided
+            nonlocal template_id
+            if template_id is None:
+                template_id = self.get_user_preference(user_id, "template_id")
             
-            new_session = ChatSession(
-                session_id=session_id,
-                user_id=user_id,
-                persona_id=p_id
-            )
-            db.add(new_session)
-            db.commit()
-            logger.info(f"✅ Persisted session {session_id} for user {user_id}")
-        except Exception as e:
-            logger.error(f"❌ Failed to persist session mapping: {e}")
-            db.rollback()
-        finally:
-            db.close()
+            db = SessionLocal()
+            try:
+                p_id = None
+                if template_id and str(template_id).isdigit():
+                    p_id = int(template_id)
+                
+                new_session = ChatSession(
+                    session_id=session_id,
+                    user_id=user_id,
+                    persona_id=p_id
+                )
+                db.add(new_session)
+                db.commit()
+                logger.info(f"✅ Persisted session {session_id} for user {user_id}")
+            except Exception as e:
+                logger.error(f"❌ Failed to persist session mapping: {e}")
+                db.rollback()
+            finally:
+                db.close()
 
-        # Get or create session store
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self.thread_pool, _persist)
+
+        # Get or create session store (sync initialization, but DB access later is async)
         store = self._get_session_store(session_id)
         
         # Add system prompt if template exists
         if template_id and template_id in self.prompt_templates:
             template = self.prompt_templates[template_id]
-            store.add_message(SystemMessage(content=template["content"]))
+            await self.add_message(session_id, "system", template["content"])
             
             # Track template usage
             self.prompt_templates[template_id]["usage_count"] = \
@@ -436,78 +439,63 @@ class LcConnector:
         logger.info(f"✅ New conversation started: {session_id} for user {user_id}")
         return session_id
     
-    def add_message(self, session_id: str, role: str, content: str) -> bool:
+    async def add_message(self, session_id: str, role: str, content: str) -> bool:
         """
-        Add a message to conversation history.
-        
-        Args:
-            session_id: Session ID
-            role: Message role (user, assistant, system)
-            content: Message content
-            
-        Returns:
-            bool: True if successful
+        Add a message to conversation history (Async).
         """
-        try:
-            store = self._get_session_store(session_id)
-            
-            if role == "user":
-                store.add_message(HumanMessage(content=content))
-            elif role == "assistant":
-                store.add_message(AIMessage(content=content))
-            elif role == "system":
-                store.add_message(SystemMessage(content=content))
-            else:
-                logger.warning(f"Unknown role: {role}")
-                return False
-            
-            logger.debug(f"Added {role} message to session {session_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to add message: {e}")
-            return False
-    
-    def get_conversation_history(self, session_id: str, as_dict: bool = False, limit: Optional[int] = None) -> Optional[List]:
-        """
-        Get conversation history for a session.
-        
-        Args:
-            session_id: Session ID
-            as_dict: If True, return as list of dicts, else return LangChain messages
-            limit: Only return last N messages
-            
-        Returns:
-            List of messages or None if session not found
-        """
-        try:
-            store = self._get_session_store(session_id)
-            messages = store.messages
-            
-            if limit:
-                # Keep system message if it's the first one, then last N-1
-                if messages and isinstance(messages[0], SystemMessage):
-                    messages = [messages[0]] + messages[-(limit-1):] if limit > 1 else [messages[0]]
+        def _add():
+            try:
+                store = self._get_session_store(session_id)
+                if role == "user":
+                    store.add_message(HumanMessage(content=content))
+                elif role == "assistant":
+                    store.add_message(AIMessage(content=content))
+                elif role == "system":
+                    store.add_message(SystemMessage(content=content))
                 else:
-                    messages = messages[-limit:]
+                    return False
+                return True
+            except Exception as e:
+                logger.error(f"Failed to add message: {e}")
+                return False
 
-            if as_dict:
-                return [
-                    {
-                        "role": "user" if isinstance(msg, HumanMessage) else
-                                "assistant" if isinstance(msg, AIMessage) else
-                                "system",
-                        "content": msg.content,
-                        "type": msg.type
-                    }
-                    for msg in messages
-                ]
-            
-            return messages
-            
-        except Exception as e:
-            logger.error(f"Failed to get conversation history: {e}")
-            return None
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.thread_pool, _add)
+    
+    async def get_conversation_history(self, session_id: str, as_dict: bool = False, limit: Optional[int] = None) -> Optional[List]:
+        """
+        Get conversation history for a session (Async).
+        """
+        def _get():
+            try:
+                store = self._get_session_store(session_id)
+                messages = store.messages
+                
+                if limit:
+                    if messages and isinstance(messages[0], SystemMessage):
+                        messages = [messages[0]] + messages[-(limit-1):] if limit > 1 else [messages[0]]
+                    else:
+                        messages = messages[-limit:]
+                return messages
+            except Exception as e:
+                logger.error(f"Failed to get conversation history: {e}")
+                return None
+
+        loop = asyncio.get_event_loop()
+        messages = await loop.run_in_executor(self.thread_pool, _get)
+        
+        if messages and as_dict:
+            return [
+                {
+                    "role": "user" if isinstance(msg, HumanMessage) else
+                            "assistant" if isinstance(msg, AIMessage) else
+                            "system",
+                    "content": msg.content,
+                    "type": msg.type
+                }
+                for msg in messages
+            ]
+        return messages
     
     def clear_conversation_history(self, session_id: str = None):
         """
@@ -540,83 +528,68 @@ class LcConnector:
         except Exception as e:
             logger.error(f"Failed to clear conversation history: {e}")
     
-    def get_user_conversations(self, user_id: int, include_deleted: bool = False) -> List[Dict[str, Any]]:
+    async def get_user_conversations(self, user_id: int, include_deleted: bool = False) -> List[Dict[str, Any]]:
         """
-        Get all conversations for a user from database.
-        
-        Args:
-            user_id: User ID
-            include_deleted: Whether to include soft-deleted sessions
-            
-        Returns:
-            List of conversation metadata
+        Get all conversations for a user from database (Async).
         """
-        db = SessionLocal()
-        try:
-            query = db.query(ChatSession).filter(ChatSession.user_id == user_id)
-            if not include_deleted:
-                query = query.filter(ChatSession.is_deleted == False)
-            
-            sessions = query.all()
-            return [
-                {
-                    "session_id": s.session_id,
-                    "persona_id": s.persona_id,
-                    "is_deleted": s.is_deleted,
-                    "created_at": s.created_at.isoformat() if s.created_at else None
-                }
-                for s in sessions
-            ]
-        except Exception as e:
-            logger.error(f"Error fetching user conversations: {e}")
-            return []
-        finally:
-            db.close()
-
-    def get_formatted_history(self, user_id: int, is_admin: bool = False, target_user_id: Optional[int] = None) -> Dict:
-        """
-        Get chat history in the requested nested format.
-        """
-        db = SessionLocal()
-        try:
-            if is_admin and target_user_id:
-                # Admin view for specific user
-                sessions = db.query(ChatSession).filter(
-                    ChatSession.user_id == target_user_id,
-                    ChatSession.is_deleted == False
-                ).all()
-            elif is_admin and not target_user_id:
-                # Admin view all users
-                sessions = db.query(ChatSession).filter(ChatSession.is_deleted == False).all()
-            else:
-                # Normal user view
-                sessions = db.query(ChatSession).filter(
-                    ChatSession.user_id == user_id,
-                    ChatSession.is_deleted == False
-                ).all()
-
-            result = {}
-            for s in sessions:
-                history = self.get_conversation_history(s.session_id, as_dict=True)
-                session_data = {}
-                for idx, msg in enumerate(history):
-                    session_data[f"msg_{idx}"] = msg
+        def _get():
+            db = SessionLocal()
+            try:
+                query = db.query(ChatSession).filter(ChatSession.user_id == user_id)
+                if not include_deleted:
+                    query = query.filter(ChatSession.is_deleted == False)
                 
-                if is_admin and not target_user_id:
-                    # Nested by user_id
-                    u_id = str(s.user_id)
-                    if u_id not in result: result[u_id] = {}
-                    result[u_id][s.session_id] = session_data
+                sessions = query.all()
+                return [
+                    {
+                        "session_id": s.session_id,
+                        "persona_id": s.persona_id,
+                        "is_deleted": s.is_deleted,
+                        "created_at": s.created_at.isoformat() if s.created_at else None
+                    }
+                    for s in sessions
+                ]
+            except Exception as e:
+                logger.error(f"Error fetching user conversations: {e}")
+                return []
+            finally:
+                db.close()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.thread_pool, _get)
+
+    async def get_formatted_history(self, user_id: int, is_admin: bool = False, target_user_id: Optional[int] = None) -> Dict:
+        """
+        Get chat history in the requested nested format (Async).
+        """
+        def _get_sessions():
+            db = SessionLocal()
+            try:
+                if is_admin and target_user_id:
+                    return db.query(ChatSession).filter(ChatSession.user_id == target_user_id, ChatSession.is_deleted == False).all()
+                elif is_admin:
+                    return db.query(ChatSession).filter(ChatSession.is_deleted == False).all()
                 else:
-                    # Nested by session_id
-                    result[s.session_id] = session_data
+                    return db.query(ChatSession).filter(ChatSession.user_id == user_id, ChatSession.is_deleted == False).all()
+            finally:
+                db.close()
+
+        loop = asyncio.get_event_loop()
+        sessions = await loop.run_in_executor(self.thread_pool, _get_sessions)
+
+        result = {}
+        for s in sessions:
+            history = await self.get_conversation_history(s.session_id, as_dict=True)
+            session_data = {f"msg_{idx}": msg for idx, msg in enumerate(history)}
             
-            return result
-        except Exception as e:
-            logger.error(f"Error formatting history: {e}")
-            return {"error": str(e)}
-        finally:
-            db.close()
+            if is_admin and not target_user_id:
+                u_id = str(s.user_id)
+                if u_id not in result: result[u_id] = {}
+                result[u_id][s.session_id] = session_data
+            else:
+                result[s.session_id] = session_data
+        
+        return result
 
     def soft_delete_session(self, session_id: str, user_id: int, is_admin: bool = False) -> bool:
         """Soft delete a chat session."""

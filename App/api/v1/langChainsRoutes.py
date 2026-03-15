@@ -383,7 +383,7 @@ async def chat(
         raise HTTPException(status_code=400, detail="No central model loaded. Admin must load a model first.")
     
     if not session_id:
-        session_id = connector.start_conversation(current_user["id"], template_id=str(persona_id))
+        session_id = await connector.start_conversation(current_user["id"], template_id=str(persona_id))
     
     result = await connector.chat_with_graph(
         message=message,
@@ -407,7 +407,7 @@ async def get_my_conversations(
 ):
     """Get all chat sessions for the current user."""
     connector = get_llm_connector()
-    sessions = connector.get_user_conversations(current_user["id"])
+    sessions = await connector.get_user_conversations(current_user["id"])
     return {"conversations": sessions}
 
 
@@ -423,7 +423,7 @@ async def get_formatted_history(
     """
     connector = get_llm_connector()
     is_admin = str(current_user.get("role", "")).lower() == "admin"
-    history = connector.get_formatted_history(
+    history = await connector.get_formatted_history(
         user_id=current_user["id"],
         is_admin=is_admin,
         target_user_id=target_user_id
@@ -511,7 +511,7 @@ async def chat_stream(
     async def generate():
         nonlocal session_id
         if not session_id:
-            session_id = connector.start_conversation(current_user["id"], template_id=str(persona_id))
+            session_id = await connector.start_conversation(current_user["id"], template_id=str(persona_id))
         
         try:
             from App.api.dependencies.graph_engine import graph_engine
@@ -521,8 +521,8 @@ async def chat_stream(
                 yield f"data: {json.dumps({'content': content, 'session_id': session_id})}\n\n"
             
             # Post-stream persistence (since we bypassed the graph 'save' node)
-            connector.add_message(session_id, "user", message)
-            connector.add_message(session_id, "assistant", full_response)
+            await connector.add_message(session_id, "user", message)
+            await connector.add_message(session_id, "assistant", full_response)
                 
         except Exception as e:
             logger.error(f"Stream error: {e}")
